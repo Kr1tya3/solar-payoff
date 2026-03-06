@@ -378,7 +378,7 @@ function renderOverviewCharts(data) {{
 }}
 
 function showOverview() {{
-  document.getElementById('overview-view').style.display = '';
+  document.getElementById('overview-view').style.display = 'block';
   document.getElementById('daily-view').style.display = 'none';
   document.getElementById('back-btn').style.display = 'none';
 }}
@@ -388,8 +388,8 @@ function showDailyDetail(date) {{
   if (!dayData) return;
 
   document.getElementById('overview-view').style.display = 'none';
-  document.getElementById('daily-view').style.display = '';
-  document.getElementById('back-btn').style.display = '';
+  document.getElementById('daily-view').style.display = 'block';
+  document.getElementById('back-btn').style.display = 'inline-block';
   document.getElementById('detail-title').textContent = 'Daily Detail - ' + date;
 
   const dayRate = dayData.import_day_rate || 0;
