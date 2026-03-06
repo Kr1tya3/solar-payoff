@@ -35,9 +35,22 @@ The goal is a daily-updated dashboard showing solar usage, money saved (self-con
 - Inverter detail: `/v1/api/inverterDetail` - params: `sn` or `id`
 - Returns arrays of time-series data points with `pac` (real-time power), `eToday` (daily generation)
 
+## Project Structure
+- `octopus.py` - Octopus Energy API client (consumption, account, tariff rates)
+- `solis.py` - Solis Cloud API client (inverter daily generation data)
+- `dashboard.py` - Main script: fetches data, calculates costs/savings, generates HTML dashboard
+- `fetch_data.py` - Legacy raw data fetcher (console output only)
+
+## Tariff Details
+- Import tariff: Economy 7 (2-register, day/night rates) - `E-2R-VAR-22-11-01-J`
+- Export tariff: Variable outgoing - `E-1R-OUTGOING-VAR-24-10-26-J`
+- Economy 7 off-peak hours (UTC): 00:30-07:30 (configurable via ECONOMY7_NIGHT_START/END)
+- Tariff codes auto-discovered from account API
+
 ## Environment Variables (.env)
 ```
 OCTOPUS_API_KEY=
+OCTOPUS_ACCOUNT_NUMBER=
 OCTOPUS_IMPORT_MPAN=
 OCTOPUS_IMPORT_SERIAL=
 OCTOPUS_EXPORT_MPAN=
@@ -46,9 +59,12 @@ SOLIS_API_ID=
 SOLIS_API_SECRET=
 SOLIS_INVERTER_SN=
 SOLIS_TIMEZONE=0
+ECONOMY7_NIGHT_START=0.5
+ECONOMY7_NIGHT_END=7.5
 ```
 
 ## Commands
-- Run: `uv run fetch_data.py`
+- Generate dashboard: `uv run dashboard.py`
+- Raw data fetch: `uv run fetch_data.py`
 - Add dependency: `uv add <package>`
 - Sync venv: `uv sync`
