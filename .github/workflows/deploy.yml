@@ -55,38 +55,37 @@ jobs:
       - name: Generate dashboard
         run: uv run dashboard.py
 
+      # Save artifacts to temp before branch switching
+      - name: Stash build outputs
+        run: |
+          cp solar.db /tmp/solar.db
+          cp dashboard.html /tmp/dashboard.html
+
       # Persist the database to the data-store branch
       - name: Save database
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Create an orphan branch or update existing
           if git rev-parse --verify origin/data-store >/dev/null 2>&1; then
             git checkout data-store
-            cp ${{ github.workspace }}/solar.db solar.db
           else
             git checkout --orphan data-store
             git rm -rf . 2>/dev/null || true
-            cp ${{ github.workspace }}/solar.db solar.db
           fi
 
+          cp /tmp/solar.db solar.db
           git add solar.db
           git diff --cached --quiet && echo "No database changes" || \
             git commit -m "Update solar.db $(date -u +%Y-%m-%d)"
           git push origin data-store
 
       # Deploy dashboard to GitHub Pages
-      - name: Checkout main for deploy
-        uses: actions/checkout@v4
-        with:
-          ref: main
-          path: main-src
-
       - name: Prepare pages artifact
         run: |
+          git checkout main
           mkdir -p _site
-          cp ${{ github.workspace }}/dashboard.html _site/index.html
+          cp /tmp/dashboard.html _site/index.html
 
       - name: Upload pages artifact
         uses: actions/upload-pages-artifact@v3
