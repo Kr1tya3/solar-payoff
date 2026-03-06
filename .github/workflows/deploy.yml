@@ -1,0 +1,96 @@
+name: Collect & Deploy
+
+on:
+  schedule:
+    # Run daily at 06:00 UTC (after Octopus data typically becomes available)
+    - cron: "0 6 * * *"
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  collect-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # Restore the database from the data branch if it exists
+      - name: Restore database
+        run: |
+          git fetch origin data-store --depth=1 2>/dev/null || true
+          if git rev-parse --verify origin/data-store >/dev/null 2>&1; then
+            git checkout origin/data-store -- solar.db 2>/dev/null || echo "No database file in data-store branch yet"
+          else
+            echo "No data-store branch yet, starting fresh"
+          fi
+
+      - name: Collect latest data
+        env:
+          OCTOPUS_API_KEY: ${{ secrets.OCTOPUS_API_KEY }}
+          OCTOPUS_ACCOUNT_NUMBER: ${{ secrets.OCTOPUS_ACCOUNT_NUMBER }}
+          OCTOPUS_IMPORT_MPAN: ${{ secrets.OCTOPUS_IMPORT_MPAN }}
+          OCTOPUS_IMPORT_SERIAL: ${{ secrets.OCTOPUS_IMPORT_SERIAL }}
+          OCTOPUS_EXPORT_MPAN: ${{ secrets.OCTOPUS_EXPORT_MPAN }}
+          OCTOPUS_EXPORT_SERIAL: ${{ secrets.OCTOPUS_EXPORT_SERIAL }}
+          SOLIS_API_ID: ${{ secrets.SOLIS_API_ID }}
+          SOLIS_API_SECRET: ${{ secrets.SOLIS_API_SECRET }}
+          SOLIS_INVERTER_SN: ${{ secrets.SOLIS_INVERTER_SN }}
+          SOLIS_TIMEZONE: ${{ vars.SOLIS_TIMEZONE || '0' }}
+          ECONOMY7_NIGHT_START: ${{ vars.ECONOMY7_NIGHT_START || '0.5' }}
+          ECONOMY7_NIGHT_END: ${{ vars.ECONOMY7_NIGHT_END || '7.5' }}
+        run: uv run collect.py
+
+      - name: Generate dashboard
+        run: uv run dashboard.py
+
+      # Persist the database to the data-store branch
+      - name: Save database
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Create an orphan branch or update existing
+          if git rev-parse --verify origin/data-store >/dev/null 2>&1; then
+            git checkout data-store
+            cp ${{ github.workspace }}/solar.db solar.db
+          else
+            git checkout --orphan data-store
+            git rm -rf . 2>/dev/null || true
+            cp ${{ github.workspace }}/solar.db solar.db
+          fi
+
+          git add solar.db
+          git diff --cached --quiet && echo "No database changes" || \
+            git commit -m "Update solar.db $(date -u +%Y-%m-%d)"
+          git push origin data-store
+
+      # Deploy dashboard to GitHub Pages
+      - name: Checkout main for deploy
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: main-src
+
+      - name: Prepare pages artifact
+        run: |
+          mkdir -p _site
+          cp ${{ github.workspace }}/dashboard.html _site/index.html
+
+      - name: Upload pages artifact
+        uses: actions/upload-pages-artifact@v3
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
