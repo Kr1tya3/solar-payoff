@@ -1,456 +1,543 @@
-"""Generate a solar energy dashboard with cost/savings calculations."""
+"""Generate a multi-timeframe solar energy dashboard from stored data."""
 
+import json
 import os
 import sys
-from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 
-import octopus
-import solis
+import db
 
 load_dotenv()
 
-# Economy 7 off-peak hours (UTC). Typical for South East England: 00:30-07:30.
-# Configurable via env vars.
-NIGHT_START_HOUR = float(os.getenv("ECONOMY7_NIGHT_START", "0.5"))  # 00:30
-NIGHT_END_HOUR = float(os.getenv("ECONOMY7_NIGHT_END", "7.5"))  # 07:30
 
+def generate_html(daily_data: list[dict], detail_by_date: dict, solar_by_date: dict) -> str:
+    """Generate the full dashboard HTML with embedded data."""
 
-def get_env(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        print(f"Error: {name} not set. See .env.example")
-        sys.exit(1)
-    return value
-
-
-def is_night_period(interval_start: str) -> bool:
-    """Check if a half-hour period falls within Economy 7 off-peak hours (UTC)."""
-    dt = datetime.fromisoformat(interval_start.replace("Z", "+00:00"))
-    hour = dt.hour + dt.minute / 60.0
-    return NIGHT_START_HOUR <= hour < NIGHT_END_HOUR
-
-
-def calculate_costs(
-    import_data: list[dict],
-    export_data: list[dict],
-    solar_generation_kwh: float,
-    import_rates: dict,
-    export_rate: float,
-) -> dict:
-    """Calculate energy costs and solar savings.
-
-    All monetary values in pence.
-    """
-    total_import_kwh = sum(r["consumption"] for r in import_data)
-    total_export_kwh = sum(r["consumption"] for r in export_data)
-    self_consumption_kwh = solar_generation_kwh - total_export_kwh
-
-    # Import cost by time-of-use
-    if "day_rate" in import_rates:
-        # Economy 7
-        day_cost = 0.0
-        night_cost = 0.0
-        day_kwh = 0.0
-        night_kwh = 0.0
-        for r in import_data:
-            kwh = r["consumption"]
-            if is_night_period(r["interval_start"]):
-                night_cost += kwh * import_rates["night_rate"]
-                night_kwh += kwh
-            else:
-                day_cost += kwh * import_rates["day_rate"]
-                day_kwh += kwh
-        import_cost = day_cost + night_cost
-    else:
-        # Standard single rate
-        import_cost = total_import_kwh * import_rates.get("unit_rate", 0)
-        day_kwh = total_import_kwh
-        night_kwh = 0
-        day_cost = import_cost
-        night_cost = 0
-
-    standing_charge = import_rates.get("standing_charge", 0)
-
-    # Export earnings
-    export_earnings = total_export_kwh * export_rate
-
-    # Solar savings = what you would have paid to import the self-consumed energy.
-    # Self-consumption happens during daylight hours, so use the day rate.
-    day_rate = import_rates.get("day_rate", import_rates.get("unit_rate", 0))
-    solar_savings = self_consumption_kwh * day_rate
-
-    return {
-        "total_import_kwh": total_import_kwh,
-        "total_export_kwh": total_export_kwh,
-        "solar_generation_kwh": solar_generation_kwh,
-        "self_consumption_kwh": self_consumption_kwh,
-        "day_import_kwh": day_kwh,
-        "night_import_kwh": night_kwh,
-        "import_cost_pence": import_cost,
-        "day_cost_pence": day_cost,
-        "night_cost_pence": night_cost,
-        "standing_charge_pence": standing_charge,
-        "total_cost_pence": import_cost + standing_charge,
-        "export_earnings_pence": export_earnings,
-        "solar_savings_pence": solar_savings,
-        "net_cost_pence": import_cost + standing_charge - export_earnings,
-        "import_rates": import_rates,
-        "export_rate": export_rate,
+    # Aggregate totals
+    totals = {
+        "generation_kwh": sum(d["generation_kwh"] or 0 for d in daily_data),
+        "import_kwh": sum(d["import_kwh"] or 0 for d in daily_data),
+        "export_kwh": sum(d["export_kwh"] or 0 for d in daily_data),
+        "self_consumption_kwh": sum(d["self_consumption_kwh"] or 0 for d in daily_data),
+        "import_cost_pence": sum(d["import_cost_pence"] or 0 for d in daily_data),
+        "standing_charge_pence": sum(d["standing_charge_pence"] or 0 for d in daily_data),
+        "export_earnings_pence": sum(d["export_earnings_pence"] or 0 for d in daily_data),
+        "solar_savings_pence": sum(d["solar_savings_pence"] or 0 for d in daily_data),
+        "day_import_kwh": sum(d["day_import_kwh"] or 0 for d in daily_data),
+        "night_import_kwh": sum(d["night_import_kwh"] or 0 for d in daily_data),
+        "days": len(daily_data),
     }
+    totals["total_cost_pence"] = totals["import_cost_pence"] + totals["standing_charge_pence"]
+    totals["net_cost_pence"] = totals["total_cost_pence"] - totals["export_earnings_pence"]
+    totals["total_benefit_pence"] = totals["solar_savings_pence"] + totals["export_earnings_pence"]
 
-
-def build_half_hourly_data(import_data: list[dict], export_data: list[dict], import_rates: dict) -> list[dict]:
-    """Build aligned half-hourly data for charting."""
-    export_by_period = {r["interval_start"]: r["consumption"] for r in export_data}
-    rows = []
-    for r in import_data:
-        start = r["interval_start"]
-        dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-        time_label = dt.strftime("%H:%M")
-        imp = r["consumption"]
-        exp = export_by_period.get(start, 0)
-        night = is_night_period(start)
-        if "day_rate" in import_rates:
-            rate = import_rates["night_rate"] if night else import_rates["day_rate"]
-        else:
-            rate = import_rates.get("unit_rate", 0)
-        rows.append({
-            "time": time_label,
-            "import_kwh": round(imp, 3),
-            "export_kwh": round(exp, 3),
-            "is_night": night,
-            "rate_p_kwh": rate,
-            "import_cost_p": round(imp * rate, 2),
-        })
-    return rows
-
-
-def generate_html(date_str: str, costs: dict, half_hourly: list[dict], solar_points: list[dict]) -> str:
-    """Generate the dashboard HTML."""
-    import json
-
-    # Prepare solar generation chart data (5-min intervals)
-    solar_times = []
-    solar_power = []
-    for p in solar_points:
-        time_str = p.get("time", p.get("timeStr", ""))
-        if ":" in time_str:
-            # Use just HH:MM
-            parts = time_str.split(":")
-            solar_times.append(f"{parts[0]}:{parts[1]}")
-        solar_power.append(p.get("pac", 0))
-
-    # Half-hourly chart data
-    hh_times = [r["time"] for r in half_hourly]
-    hh_import = [r["import_kwh"] for r in half_hourly]
-    hh_export = [r["export_kwh"] for r in half_hourly]
-    hh_night = [r["is_night"] for r in half_hourly]
-
-    c = costs
-    gen = c["solar_generation_kwh"]
-    self_pct = (c["self_consumption_kwh"] / gen * 100) if gen > 0 else 0
+    # Serialize data for JS
+    daily_json = json.dumps(daily_data, default=str)
+    detail_json = json.dumps(detail_by_date, default=str)
+    solar_json = json.dumps(solar_by_date, default=str)
+    totals_json = json.dumps(totals)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Solar Dashboard - {date_str}</title>
+<title>Solar Energy Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
-  :root {{
-    --bg: #0f172a; --card: #1e293b; --border: #334155;
-    --text: #e2e8f0; --muted: #94a3b8;
-    --green: #22c55e; --yellow: #eab308; --blue: #3b82f6;
-    --red: #ef4444; --purple: #a855f7;
-  }}
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-         background: var(--bg); color: var(--text); padding: 1.5rem; }}
-  h1 {{ font-size: 1.5rem; margin-bottom: 0.25rem; }}
-  .date {{ color: var(--muted); margin-bottom: 1.5rem; font-size: 0.9rem; }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }}
-  .card {{ background: var(--card); border: 1px solid var(--border); border-radius: 0.75rem; padding: 1.25rem; }}
-  .card-label {{ font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }}
-  .card-value {{ font-size: 1.75rem; font-weight: 700; }}
-  .card-sub {{ font-size: 0.8rem; color: var(--muted); margin-top: 0.25rem; }}
-  .green {{ color: var(--green); }}
-  .yellow {{ color: var(--yellow); }}
-  .blue {{ color: var(--blue); }}
-  .red {{ color: var(--red); }}
-  .purple {{ color: var(--purple); }}
-  .chart-container {{ background: var(--card); border: 1px solid var(--border); border-radius: 0.75rem; padding: 1.25rem; margin-bottom: 1.5rem; }}
-  .chart-title {{ font-size: 1rem; font-weight: 600; margin-bottom: 1rem; }}
-  .chart-wrap {{ position: relative; height: 300px; }}
-  .rate-info {{ display: flex; gap: 1.5rem; flex-wrap: wrap; margin-bottom: 1.5rem; }}
-  .rate-badge {{ background: var(--card); border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.5rem 1rem; font-size: 0.85rem; }}
-  .rate-badge span {{ font-weight: 600; }}
+:root {{
+  --bg: #0f172a; --card: #1e293b; --border: #334155;
+  --text: #e2e8f0; --muted: #94a3b8;
+  --green: #22c55e; --yellow: #eab308; --blue: #3b82f6;
+  --red: #ef4444; --purple: #a855f7; --orange: #f97316;
+}}
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+       background: var(--bg); color: var(--text); padding: 1.5rem; max-width: 1400px; margin: 0 auto; }}
+h1 {{ font-size: 1.5rem; margin-bottom: 0.25rem; }}
+.header {{ display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.5rem; }}
+.subtitle {{ color: var(--muted); font-size: 0.9rem; }}
+.tabs {{ display: flex; gap: 0.5rem; flex-wrap: wrap; }}
+.tab {{ padding: 0.4rem 1rem; border-radius: 0.5rem; border: 1px solid var(--border);
+        background: var(--card); color: var(--muted); cursor: pointer; font-size: 0.85rem; }}
+.tab.active {{ background: var(--blue); color: white; border-color: var(--blue); }}
+.tab:hover {{ border-color: var(--blue); }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }}
+.card {{ background: var(--card); border: 1px solid var(--border); border-radius: 0.75rem; padding: 1.25rem; }}
+.card-label {{ font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }}
+.card-value {{ font-size: 1.5rem; font-weight: 700; }}
+.card-sub {{ font-size: 0.78rem; color: var(--muted); margin-top: 0.25rem; }}
+.green {{ color: var(--green); }} .yellow {{ color: var(--yellow); }}
+.blue {{ color: var(--blue); }} .red {{ color: var(--red); }}
+.purple {{ color: var(--purple); }} .orange {{ color: var(--orange); }}
+.chart-container {{ background: var(--card); border: 1px solid var(--border); border-radius: 0.75rem; padding: 1.25rem; margin-bottom: 1.5rem; }}
+.chart-title {{ font-size: 1rem; font-weight: 600; margin-bottom: 1rem; }}
+.chart-wrap {{ position: relative; height: 300px; }}
+.back-btn {{ display: none; padding: 0.4rem 1rem; border-radius: 0.5rem; border: 1px solid var(--border);
+             background: var(--card); color: var(--muted); cursor: pointer; font-size: 0.85rem; margin-bottom: 1rem; }}
+.back-btn:hover {{ border-color: var(--blue); color: var(--text); }}
+#daily-view {{ display: none; }}
+.charts-row {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }}
+@media (max-width: 900px) {{ .charts-row {{ grid-template-columns: 1fr; }} }}
 </style>
 </head>
 <body>
 
-<h1>Solar Energy Dashboard</h1>
-<p class="date">{date_str}</p>
+<!-- Overview view -->
+<div id="overview-view">
+  <div class="header">
+    <div>
+      <h1>Solar Energy Dashboard</h1>
+      <p class="subtitle" id="date-range"></p>
+    </div>
+    <div class="tabs" id="period-tabs">
+      <div class="tab" data-period="7">7 Days</div>
+      <div class="tab" data-period="30">30 Days</div>
+      <div class="tab" data-period="90">90 Days</div>
+      <div class="tab active" data-period="all">All Time</div>
+    </div>
+  </div>
 
-<div class="rate-info">
-  <div class="rate-badge">Day rate: <span>{c['import_rates'].get('day_rate', c['import_rates'].get('unit_rate', 0)):.2f}p/kWh</span></div>
-  <div class="rate-badge">Night rate: <span>{c['import_rates'].get('night_rate', '-')}{"p/kWh" if 'night_rate' in c['import_rates'] else ''}</span></div>
-  <div class="rate-badge">Export rate: <span>{c['export_rate']:.2f}p/kWh</span></div>
-  <div class="rate-badge">Standing charge: <span>{c['standing_charge_pence']:.2f}p/day</span></div>
-</div>
+  <div class="grid" id="summary-cards"></div>
 
-<div class="grid">
-  <div class="card">
-    <div class="card-label">Solar Generated</div>
-    <div class="card-value yellow">{gen:.1f} kWh</div>
-    <div class="card-sub">Self-consumed: {c['self_consumption_kwh']:.1f} kWh ({self_pct:.0f}%)</div>
+  <div class="charts-row">
+    <div class="chart-container">
+      <div class="chart-title">Daily Energy (kWh)</div>
+      <div class="chart-wrap"><canvas id="dailyEnergyChart"></canvas></div>
+    </div>
+    <div class="chart-container">
+      <div class="chart-title">Daily Costs &amp; Earnings (p)</div>
+      <div class="chart-wrap"><canvas id="dailyCostChart"></canvas></div>
+    </div>
   </div>
-  <div class="card">
-    <div class="card-label">Grid Import</div>
-    <div class="card-value red">{c['total_import_kwh']:.1f} kWh</div>
-    <div class="card-sub">Day: {c['day_import_kwh']:.1f} / Night: {c['night_import_kwh']:.1f} kWh</div>
+
+  <div class="chart-container">
+    <div class="chart-title">Cumulative Solar Benefit</div>
+    <div class="chart-wrap"><canvas id="cumulativeChart"></canvas></div>
   </div>
-  <div class="card">
-    <div class="card-label">Grid Export</div>
-    <div class="card-value blue">{c['total_export_kwh']:.1f} kWh</div>
-    <div class="card-sub">Exported surplus solar</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Import Cost</div>
-    <div class="card-value red">&pound;{c['total_cost_pence'] / 100:.2f}</div>
-    <div class="card-sub">Energy: &pound;{c['import_cost_pence'] / 100:.2f} + Standing: &pound;{c['standing_charge_pence'] / 100:.2f}</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Export Earnings</div>
-    <div class="card-value green">&pound;{c['export_earnings_pence'] / 100:.2f}</div>
-    <div class="card-sub">{c['total_export_kwh']:.1f} kWh @ {c['export_rate']:.1f}p</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Solar Savings</div>
-    <div class="card-value green">&pound;{c['solar_savings_pence'] / 100:.2f}</div>
-    <div class="card-sub">Avoided import cost from self-use</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Net Cost</div>
-    <div class="card-value purple">&pound;{c['net_cost_pence'] / 100:.2f}</div>
-    <div class="card-sub">Import + standing - export</div>
-  </div>
-  <div class="card">
-    <div class="card-label">Total Solar Benefit</div>
-    <div class="card-value green">&pound;{(c['solar_savings_pence'] + c['export_earnings_pence']) / 100:.2f}</div>
-    <div class="card-sub">Savings + export earnings</div>
+
+  <div class="charts-row">
+    <div class="chart-container">
+      <div class="chart-title">Energy Flow Breakdown</div>
+      <div class="chart-wrap" style="height:250px"><canvas id="flowChart"></canvas></div>
+    </div>
+    <div class="chart-container">
+      <div class="chart-title">Financial Summary</div>
+      <div class="chart-wrap" style="height:250px"><canvas id="financialChart"></canvas></div>
+    </div>
   </div>
 </div>
 
-<div class="chart-container">
-  <div class="chart-title">Solar Generation (5-min intervals)</div>
-  <div class="chart-wrap"><canvas id="solarChart"></canvas></div>
-</div>
+<!-- Daily detail view -->
+<div id="daily-view">
+  <button class="back-btn" id="back-btn" onclick="showOverview()">&larr; Back to overview</button>
+  <div class="header">
+    <div>
+      <h1 id="detail-title">Daily Detail</h1>
+      <p class="subtitle" id="detail-rates"></p>
+    </div>
+  </div>
 
-<div class="chart-container">
-  <div class="chart-title">Grid Import / Export (half-hourly)</div>
-  <div class="chart-wrap"><canvas id="gridChart"></canvas></div>
-</div>
+  <div class="grid" id="detail-cards"></div>
 
-<div class="chart-container">
-  <div class="chart-title">Energy Flow Summary</div>
-  <div class="chart-wrap" style="height:250px"><canvas id="flowChart"></canvas></div>
+  <div class="chart-container">
+    <div class="chart-title">Solar Generation (5-min intervals)</div>
+    <div class="chart-wrap"><canvas id="solarChart"></canvas></div>
+  </div>
+
+  <div class="chart-container">
+    <div class="chart-title">Grid Import / Export (half-hourly)</div>
+    <div class="chart-wrap"><canvas id="gridChart"></canvas></div>
+  </div>
 </div>
 
 <script>
-const solarTimes = {json.dumps(solar_times)};
-const solarPower = {json.dumps(solar_power)};
-const hhTimes = {json.dumps(hh_times)};
-const hhImport = {json.dumps(hh_import)};
-const hhExport = {json.dumps(hh_export)};
-const hhNight = {json.dumps(hh_night)};
+const allDaily = {daily_json};
+const detailByDate = {detail_json};
+const solarByDate = {solar_json};
 
 Chart.defaults.color = '#94a3b8';
 Chart.defaults.borderColor = '#334155';
 
-// Solar generation chart
-new Chart(document.getElementById('solarChart'), {{
-  type: 'line',
-  data: {{
-    labels: solarTimes,
-    datasets: [{{
-      label: 'Solar Power (W)',
-      data: solarPower,
-      borderColor: '#eab308',
-      backgroundColor: 'rgba(234,179,8,0.1)',
-      fill: true,
-      pointRadius: 0,
-      borderWidth: 2,
-      tension: 0.3,
-    }}]
-  }},
-  options: {{
-    responsive: true, maintainAspectRatio: false,
-    scales: {{
-      x: {{ ticks: {{ maxTicksLimit: 24, maxRotation: 0 }} }},
-      y: {{ beginAtZero: true, title: {{ display: true, text: 'Watts' }} }}
-    }},
-    plugins: {{ legend: {{ display: false }} }}
-  }}
-}});
+let currentPeriod = 'all';
+let charts = {{}};
 
-// Grid import/export chart
-const nightBg = hhNight.map(n => n ? 'rgba(59,130,246,0.8)' : 'rgba(239,68,68,0.8)');
-new Chart(document.getElementById('gridChart'), {{
-  type: 'bar',
-  data: {{
-    labels: hhTimes,
-    datasets: [
-      {{
-        label: 'Import (kWh)',
-        data: hhImport,
-        backgroundColor: nightBg,
+function destroyChart(name) {{
+  if (charts[name]) {{ charts[name].destroy(); charts[name] = null; }}
+}}
+
+function filterData(period) {{
+  if (period === 'all') return allDaily;
+  const n = parseInt(period);
+  return allDaily.slice(-n);
+}}
+
+function fmt(pence) {{ return '\\u00a3' + (pence / 100).toFixed(2); }}
+function fmtKwh(v) {{ return v.toFixed(1) + ' kWh'; }}
+
+function sumField(data, field) {{
+  return data.reduce((s, d) => s + (d[field] || 0), 0);
+}}
+
+function renderSummaryCards(data) {{
+  const gen = sumField(data, 'generation_kwh');
+  const imp = sumField(data, 'import_kwh');
+  const exp = sumField(data, 'export_kwh');
+  const self = sumField(data, 'self_consumption_kwh');
+  const impCost = sumField(data, 'import_cost_pence') + sumField(data, 'standing_charge_pence');
+  const expEarn = sumField(data, 'export_earnings_pence');
+  const savings = sumField(data, 'solar_savings_pence');
+  const benefit = savings + expEarn;
+  const net = impCost - expEarn;
+  const selfPct = gen > 0 ? (self / gen * 100).toFixed(0) : 0;
+  const days = data.length;
+
+  document.getElementById('summary-cards').innerHTML = `
+    <div class="card"><div class="card-label">Solar Generated</div>
+      <div class="card-value yellow">${{fmtKwh(gen)}}</div>
+      <div class="card-sub">${{fmtKwh(gen/days)}}/day avg</div></div>
+    <div class="card"><div class="card-label">Self-consumed</div>
+      <div class="card-value orange">${{fmtKwh(self)}}</div>
+      <div class="card-sub">${{selfPct}}% of generation</div></div>
+    <div class="card"><div class="card-label">Grid Import</div>
+      <div class="card-value red">${{fmtKwh(imp)}}</div>
+      <div class="card-sub">${{fmtKwh(imp/days)}}/day avg</div></div>
+    <div class="card"><div class="card-label">Grid Export</div>
+      <div class="card-value blue">${{fmtKwh(exp)}}</div>
+      <div class="card-sub">${{fmtKwh(exp/days)}}/day avg</div></div>
+    <div class="card"><div class="card-label">Import Cost</div>
+      <div class="card-value red">${{fmt(impCost)}}</div>
+      <div class="card-sub">${{fmt(impCost/days)}}/day avg</div></div>
+    <div class="card"><div class="card-label">Export Earnings</div>
+      <div class="card-value green">${{fmt(expEarn)}}</div>
+      <div class="card-sub">${{fmt(expEarn/days)}}/day avg</div></div>
+    <div class="card"><div class="card-label">Solar Savings</div>
+      <div class="card-value green">${{fmt(savings)}}</div>
+      <div class="card-sub">Avoided import cost</div></div>
+    <div class="card"><div class="card-label">Total Solar Benefit</div>
+      <div class="card-value green">${{fmt(benefit)}}</div>
+      <div class="card-sub">${{fmt(benefit/days)}}/day avg</div></div>
+  `;
+}}
+
+function renderOverviewCharts(data) {{
+  const dates = data.map(d => d.date);
+  const shortDates = dates.map(d => {{
+    const parts = d.split('-');
+    return parts[2] + '/' + parts[1];
+  }});
+
+  // Daily energy chart
+  destroyChart('dailyEnergy');
+  charts.dailyEnergy = new Chart(document.getElementById('dailyEnergyChart'), {{
+    type: 'bar',
+    data: {{
+      labels: shortDates,
+      datasets: [
+        {{ label: 'Generation', data: data.map(d => d.generation_kwh), backgroundColor: 'rgba(234,179,8,0.8)', order: 2 }},
+        {{ label: 'Import', data: data.map(d => d.import_kwh), backgroundColor: 'rgba(239,68,68,0.8)', order: 2 }},
+        {{ label: 'Export', data: data.map(d => -d.export_kwh), backgroundColor: 'rgba(34,197,94,0.8)', order: 2 }},
+      ]
+    }},
+    options: {{
+      responsive: true, maintainAspectRatio: false,
+      onClick: (e, elements) => {{
+        if (elements.length > 0) {{
+          const idx = elements[0].index;
+          showDailyDetail(data[idx].date);
+        }}
       }},
-      {{
-        label: 'Export (kWh)',
-        data: hhExport.map(v => -v),
-        backgroundColor: 'rgba(34,197,94,0.8)',
-      }}
-    ]
-  }},
-  options: {{
-    responsive: true, maintainAspectRatio: false,
-    scales: {{
-      x: {{ stacked: true, ticks: {{ maxRotation: 0 }} }},
-      y: {{ stacked: true, title: {{ display: true, text: 'kWh' }} }}
-    }},
-    plugins: {{
-      tooltip: {{
-        callbacks: {{
-          label: function(ctx) {{
-            const val = Math.abs(ctx.raw);
-            return ctx.dataset.label + ': ' + val.toFixed(3) + ' kWh';
+      scales: {{
+        x: {{ ticks: {{ maxRotation: 0, maxTicksLimit: 15 }} }},
+        y: {{ title: {{ display: true, text: 'kWh' }} }}
+      }},
+      plugins: {{
+        tooltip: {{
+          callbacks: {{
+            title: (items) => dates[items[0].dataIndex],
+            label: (ctx) => ctx.dataset.label + ': ' + Math.abs(ctx.raw).toFixed(1) + ' kWh'
           }}
         }}
       }}
     }}
+  }});
+
+  // Daily cost chart
+  destroyChart('dailyCost');
+  charts.dailyCost = new Chart(document.getElementById('dailyCostChart'), {{
+    type: 'bar',
+    data: {{
+      labels: shortDates,
+      datasets: [
+        {{ label: 'Import Cost', data: data.map(d => (d.import_cost_pence||0) + (d.standing_charge_pence||0)),
+           backgroundColor: 'rgba(239,68,68,0.8)' }},
+        {{ label: 'Export Earnings', data: data.map(d => -(d.export_earnings_pence||0)),
+           backgroundColor: 'rgba(34,197,94,0.8)' }},
+        {{ label: 'Solar Savings', data: data.map(d => -(d.solar_savings_pence||0)),
+           backgroundColor: 'rgba(234,179,8,0.8)' }},
+      ]
+    }},
+    options: {{
+      responsive: true, maintainAspectRatio: false,
+      onClick: (e, elements) => {{
+        if (elements.length > 0) showDailyDetail(data[elements[0].index].date);
+      }},
+      scales: {{
+        x: {{ stacked: true, ticks: {{ maxRotation: 0, maxTicksLimit: 15 }} }},
+        y: {{ stacked: true, title: {{ display: true, text: 'Pence' }} }}
+      }},
+      plugins: {{
+        tooltip: {{
+          callbacks: {{
+            title: (items) => dates[items[0].dataIndex],
+            label: (ctx) => ctx.dataset.label + ': ' + Math.abs(ctx.raw).toFixed(1) + 'p'
+          }}
+        }}
+      }}
+    }}
+  }});
+
+  // Cumulative benefit chart
+  destroyChart('cumulative');
+  let cumBenefit = 0, cumExport = 0, cumSavings = 0;
+  const cumData = data.map(d => {{
+    cumExport += (d.export_earnings_pence || 0);
+    cumSavings += (d.solar_savings_pence || 0);
+    cumBenefit = cumExport + cumSavings;
+    return {{ benefit: cumBenefit / 100, exportEarn: cumExport / 100, savings: cumSavings / 100 }};
+  }});
+  charts.cumulative = new Chart(document.getElementById('cumulativeChart'), {{
+    type: 'line',
+    data: {{
+      labels: shortDates,
+      datasets: [
+        {{ label: 'Total Benefit', data: cumData.map(d => d.benefit),
+           borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,0.1)', fill: true, pointRadius: 0, borderWidth: 2 }},
+        {{ label: 'Export Earnings', data: cumData.map(d => d.exportEarn),
+           borderColor: '#3b82f6', borderDash: [5,5], pointRadius: 0, borderWidth: 1.5 }},
+        {{ label: 'Solar Savings', data: cumData.map(d => d.savings),
+           borderColor: '#eab308', borderDash: [5,5], pointRadius: 0, borderWidth: 1.5 }},
+      ]
+    }},
+    options: {{
+      responsive: true, maintainAspectRatio: false,
+      scales: {{
+        x: {{ ticks: {{ maxRotation: 0, maxTicksLimit: 15 }} }},
+        y: {{ title: {{ display: true, text: '\\u00a3' }} }}
+      }}
+    }}
+  }});
+
+  // Energy flow doughnut
+  destroyChart('flow');
+  const self = sumField(data, 'self_consumption_kwh');
+  const exp = sumField(data, 'export_kwh');
+  const dayImp = sumField(data, 'day_import_kwh');
+  const nightImp = sumField(data, 'night_import_kwh');
+  charts.flow = new Chart(document.getElementById('flowChart'), {{
+    type: 'doughnut',
+    data: {{
+      labels: ['Self-consumed', 'Exported', 'Import (Day)', 'Import (Night)'],
+      datasets: [{{ data: [self, exp, dayImp, nightImp].map(v => +v.toFixed(1)),
+                     backgroundColor: ['#eab308', '#22c55e', '#ef4444', '#3b82f6'] }}]
+    }},
+    options: {{
+      responsive: true, maintainAspectRatio: false,
+      plugins: {{ legend: {{ position: 'right' }},
+        tooltip: {{ callbacks: {{ label: (ctx) => ctx.label + ': ' + ctx.raw + ' kWh' }} }}
+      }}
+    }}
+  }});
+
+  // Financial doughnut
+  destroyChart('financial');
+  const impCost = sumField(data, 'import_cost_pence') + sumField(data, 'standing_charge_pence');
+  const expEarn = sumField(data, 'export_earnings_pence');
+  const savings = sumField(data, 'solar_savings_pence');
+  charts.financial = new Chart(document.getElementById('financialChart'), {{
+    type: 'doughnut',
+    data: {{
+      labels: ['Import Cost', 'Export Earnings', 'Solar Savings'],
+      datasets: [{{ data: [impCost/100, expEarn/100, savings/100].map(v => +v.toFixed(2)),
+                     backgroundColor: ['#ef4444', '#22c55e', '#eab308'] }}]
+    }},
+    options: {{
+      responsive: true, maintainAspectRatio: false,
+      plugins: {{ legend: {{ position: 'right' }},
+        tooltip: {{ callbacks: {{ label: (ctx) => ctx.label + ': \\u00a3' + ctx.raw.toFixed(2) }} }}
+      }}
+    }}
+  }});
+
+  // Date range subtitle
+  if (data.length > 0) {{
+    document.getElementById('date-range').textContent =
+      data[0].date + ' to ' + data[data.length-1].date + ' (' + data.length + ' days)';
   }}
+}}
+
+function showOverview() {{
+  document.getElementById('overview-view').style.display = '';
+  document.getElementById('daily-view').style.display = 'none';
+  document.getElementById('back-btn').style.display = 'none';
+}}
+
+function showDailyDetail(date) {{
+  const dayData = allDaily.find(d => d.date === date);
+  if (!dayData) return;
+
+  document.getElementById('overview-view').style.display = 'none';
+  document.getElementById('daily-view').style.display = '';
+  document.getElementById('back-btn').style.display = '';
+  document.getElementById('detail-title').textContent = 'Daily Detail - ' + date;
+
+  const dayRate = dayData.import_day_rate || 0;
+  const nightRate = dayData.import_night_rate || 0;
+  const expRate = dayData.export_rate || 0;
+  document.getElementById('detail-rates').textContent =
+    `Day: ${{dayRate.toFixed(2)}}p/kWh | Night: ${{nightRate.toFixed(2)}}p/kWh | Export: ${{expRate.toFixed(2)}}p/kWh`;
+
+  const gen = dayData.generation_kwh || 0;
+  const self = dayData.self_consumption_kwh || 0;
+  const selfPct = gen > 0 ? (self/gen*100).toFixed(0) : 0;
+  const impCost = (dayData.import_cost_pence||0) + (dayData.standing_charge_pence||0);
+  const benefit = (dayData.solar_savings_pence||0) + (dayData.export_earnings_pence||0);
+
+  document.getElementById('detail-cards').innerHTML = `
+    <div class="card"><div class="card-label">Solar Generated</div>
+      <div class="card-value yellow">${{fmtKwh(gen)}}</div>
+      <div class="card-sub">Self-consumed: ${{fmtKwh(self)}} (${{selfPct}}%)</div></div>
+    <div class="card"><div class="card-label">Grid Import</div>
+      <div class="card-value red">${{fmtKwh(dayData.import_kwh)}}</div>
+      <div class="card-sub">Day: ${{fmtKwh(dayData.day_import_kwh)}} / Night: ${{fmtKwh(dayData.night_import_kwh)}}</div></div>
+    <div class="card"><div class="card-label">Grid Export</div>
+      <div class="card-value blue">${{fmtKwh(dayData.export_kwh)}}</div></div>
+    <div class="card"><div class="card-label">Import Cost</div>
+      <div class="card-value red">${{fmt(impCost)}}</div>
+      <div class="card-sub">Energy ${{fmt(dayData.import_cost_pence)}} + Standing ${{fmt(dayData.standing_charge_pence)}}</div></div>
+    <div class="card"><div class="card-label">Export Earnings</div>
+      <div class="card-value green">${{fmt(dayData.export_earnings_pence)}}</div></div>
+    <div class="card"><div class="card-label">Solar Savings</div>
+      <div class="card-value green">${{fmt(dayData.solar_savings_pence)}}</div></div>
+    <div class="card"><div class="card-label">Total Benefit</div>
+      <div class="card-value green">${{fmt(benefit)}}</div></div>
+    <div class="card"><div class="card-label">Net Cost</div>
+      <div class="card-value purple">${{fmt(impCost - (dayData.export_earnings_pence||0))}}</div></div>
+  `;
+
+  // Solar generation chart
+  const solar = solarByDate[date] || [];
+  destroyChart('solar');
+  const sTimes = solar.map(p => {{
+    const parts = p.time_str.split(':');
+    return parts.length >= 2 ? parts[0]+':'+parts[1] : p.time_str;
+  }});
+  charts.solar = new Chart(document.getElementById('solarChart'), {{
+    type: 'line',
+    data: {{
+      labels: sTimes,
+      datasets: [{{
+        label: 'Solar Power (W)', data: solar.map(p => p.pac_watts),
+        borderColor: '#eab308', backgroundColor: 'rgba(234,179,8,0.1)',
+        fill: true, pointRadius: 0, borderWidth: 2, tension: 0.3,
+      }}]
+    }},
+    options: {{
+      responsive: true, maintainAspectRatio: false,
+      scales: {{
+        x: {{ ticks: {{ maxTicksLimit: 24, maxRotation: 0 }} }},
+        y: {{ beginAtZero: true, title: {{ display: true, text: 'Watts' }} }}
+      }},
+      plugins: {{ legend: {{ display: false }} }}
+    }}
+  }});
+
+  // Grid import/export chart
+  const hh = detailByDate[date] || [];
+  destroyChart('grid');
+  const nightBg = hh.map(r => r.is_night ? 'rgba(59,130,246,0.8)' : 'rgba(239,68,68,0.8)');
+  charts.grid = new Chart(document.getElementById('gridChart'), {{
+    type: 'bar',
+    data: {{
+      labels: hh.map(r => {{
+        const d = new Date(r.interval_start);
+        return String(d.getUTCHours()).padStart(2,'0') + ':' + String(d.getUTCMinutes()).padStart(2,'0');
+      }}),
+      datasets: [
+        {{ label: 'Import (kWh)', data: hh.map(r => r.import_kwh), backgroundColor: nightBg }},
+        {{ label: 'Export (kWh)', data: hh.map(r => -r.export_kwh), backgroundColor: 'rgba(34,197,94,0.8)' }},
+      ]
+    }},
+    options: {{
+      responsive: true, maintainAspectRatio: false,
+      scales: {{
+        x: {{ stacked: true, ticks: {{ maxRotation: 0 }} }},
+        y: {{ stacked: true, title: {{ display: true, text: 'kWh' }} }}
+      }},
+      plugins: {{
+        tooltip: {{
+          callbacks: {{ label: (ctx) => ctx.dataset.label + ': ' + Math.abs(ctx.raw).toFixed(3) + ' kWh' }}
+        }}
+      }}
+    }}
+  }});
+}}
+
+// Tab switching
+document.querySelectorAll('.tab').forEach(tab => {{
+  tab.addEventListener('click', () => {{
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    currentPeriod = tab.dataset.period;
+    const data = filterData(currentPeriod);
+    renderSummaryCards(data);
+    renderOverviewCharts(data);
+  }});
 }});
 
-// Energy flow summary (doughnut)
-new Chart(document.getElementById('flowChart'), {{
-  type: 'doughnut',
-  data: {{
-    labels: ['Self-consumed', 'Exported', 'Grid Import (Day)', 'Grid Import (Night)'],
-    datasets: [{{
-      data: [{c['self_consumption_kwh']:.2f}, {c['total_export_kwh']:.2f}, {c['day_import_kwh']:.2f}, {c['night_import_kwh']:.2f}],
-      backgroundColor: ['#eab308', '#22c55e', '#ef4444', '#3b82f6'],
-    }}]
-  }},
-  options: {{
-    responsive: true, maintainAspectRatio: false,
-    plugins: {{
-      legend: {{ position: 'right' }},
-      tooltip: {{
-        callbacks: {{
-          label: function(ctx) {{
-            return ctx.label + ': ' + ctx.raw.toFixed(1) + ' kWh';
-          }}
-        }}
-      }}
-    }}
-  }}
-}});
+// Initial render
+renderSummaryCards(allDaily);
+renderOverviewCharts(allDaily);
 </script>
 </body>
 </html>"""
 
 
-def find_latest_date(api_key: str, mpan: str, serial: str) -> str | None:
-    """Find the most recent date with available Octopus data (up to 5 days back)."""
-    for days_ago in range(1, 6):
-        day = datetime.now(timezone.utc) - timedelta(days=days_ago)
-        date_str = day.strftime("%Y-%m-%d")
-        period_from = f"{date_str}T00:00:00Z"
-        period_to = (day + timedelta(days=1)).strftime("%Y-%m-%d") + "T00:00:00Z"
-        data = octopus.fetch_consumption(api_key, mpan, serial, period_from, period_to)
-        if data:
-            return date_str
-    return None
-
-
 def main():
-    # Load config
-    api_key = get_env("OCTOPUS_API_KEY")
-    account = get_env("OCTOPUS_ACCOUNT_NUMBER")
-    import_mpan = get_env("OCTOPUS_IMPORT_MPAN")
-    import_serial = get_env("OCTOPUS_IMPORT_SERIAL")
-    export_mpan = get_env("OCTOPUS_EXPORT_MPAN")
-    export_serial = get_env("OCTOPUS_EXPORT_SERIAL")
-    solis_id = get_env("SOLIS_API_ID")
-    solis_secret = get_env("SOLIS_API_SECRET")
-    solis_sn = get_env("SOLIS_INVERTER_SN")
-    solis_tz = int(os.getenv("SOLIS_TIMEZONE", "0"))
+    db.init_db()
+    conn = db.get_connection()
 
-    # Find latest available date
-    print("Finding latest available data...")
-    date_str = find_latest_date(api_key, import_mpan, import_serial)
-    if not date_str:
-        print("No Octopus data found in the last 5 days.")
+    daily_data = db.get_daily_summaries(conn)
+    if not daily_data:
+        print("No data in database. Run 'uv run collect.py --backfill' first.")
         sys.exit(1)
 
-    period_from = f"{date_str}T00:00:00Z"
-    next_day = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-    period_to = f"{next_day}T00:00:00Z"
-    print(f"Using date: {date_str}")
+    print(f"Generating dashboard for {len(daily_data)} days...")
 
-    # Fetch consumption data
-    print("Fetching import/export data...")
-    import_data = octopus.fetch_consumption(api_key, import_mpan, import_serial, period_from, period_to)
-    export_data = octopus.fetch_consumption(api_key, export_mpan, export_serial, period_from, period_to)
+    # Load detail data for each date
+    detail_by_date = {}
+    solar_by_date = {}
+    for d in daily_data:
+        date = d["date"]
+        detail_by_date[date] = db.get_half_hourly(conn, date)
+        solar_by_date[date] = db.get_solar_5min(conn, date)
 
-    # Fetch tariff info
-    print("Fetching tariff rates...")
-    tariffs = octopus.get_active_tariffs(api_key, account, date_str)
+    conn.close()
 
-    import_tariff = tariffs["import"]
-    import_rates = octopus.fetch_rates(
-        import_tariff["product_code"], import_tariff["tariff_code"],
-        period_from, period_to, import_tariff["is_economy7"],
-    )
-
-    export_tariff = tariffs["export"]
-    export_rate = octopus.fetch_export_rates(
-        export_tariff["product_code"], export_tariff["tariff_code"],
-        period_from, period_to,
-    )
-
-    # Fetch solar data
-    print("Fetching solar generation data...")
-    solar_points = solis.fetch_inverter_day(solis_id, solis_secret, solis_sn, date_str, solis_tz)
-    solar_gen = solar_points[-1].get("eToday", 0) if solar_points else 0
-
-    # Calculate costs
-    costs = calculate_costs(import_data, export_data, solar_gen, import_rates, export_rate)
-
-    # Print summary
-    print(f"\n{'='*50}")
-    print(f"  Date:             {date_str}")
-    print(f"  Solar generated:  {costs['solar_generation_kwh']:.1f} kWh")
-    print(f"  Self-consumed:    {costs['self_consumption_kwh']:.1f} kWh")
-    print(f"  Grid import:      {costs['total_import_kwh']:.1f} kWh")
-    print(f"  Grid export:      {costs['total_export_kwh']:.1f} kWh")
-    print(f"  Import cost:      \u00a3{costs['total_cost_pence']/100:.2f}")
-    print(f"  Export earnings:  \u00a3{costs['export_earnings_pence']/100:.2f}")
-    print(f"  Solar savings:    \u00a3{costs['solar_savings_pence']/100:.2f}")
-    print(f"  Net cost:         \u00a3{costs['net_cost_pence']/100:.2f}")
-    print(f"  Total benefit:    \u00a3{(costs['solar_savings_pence']+costs['export_earnings_pence'])/100:.2f}")
-    print(f"{'='*50}")
-
-    # Generate dashboard
-    half_hourly = build_half_hourly_data(import_data, export_data, import_rates)
-    html = generate_html(date_str, costs, half_hourly, solar_points)
+    html = generate_html(daily_data, detail_by_date, solar_by_date)
     output_path = os.path.join(os.path.dirname(__file__), "dashboard.html")
     with open(output_path, "w") as f:
         f.write(html)
-    print(f"\nDashboard written to {output_path}")
+
+    first = daily_data[0]["date"]
+    last = daily_data[-1]["date"]
+    total_benefit = sum(
+        (d["solar_savings_pence"] or 0) + (d["export_earnings_pence"] or 0) for d in daily_data
+    )
+    print(f"Period: {first} to {last} ({len(daily_data)} days)")
+    print(f"Total solar benefit: \u00a3{total_benefit/100:.2f}")
+    print(f"Dashboard written to {output_path}")
 
 
 if __name__ == "__main__":

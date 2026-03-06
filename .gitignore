@@ -1,5 +1,8 @@
-# Generated dashboard
+# Generated files
 dashboard.html
+solar.db
+solar.db-wal
+solar.db-shm
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

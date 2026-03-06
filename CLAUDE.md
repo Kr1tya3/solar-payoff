@@ -38,8 +38,11 @@ The goal is a daily-updated dashboard showing solar usage, money saved (self-con
 ## Project Structure
 - `octopus.py` - Octopus Energy API client (consumption, account, tariff rates)
 - `solis.py` - Solis Cloud API client (inverter daily generation data)
-- `dashboard.py` - Main script: fetches data, calculates costs/savings, generates HTML dashboard
+- `db.py` - SQLite database layer (stores daily summaries, half-hourly, solar 5-min data)
+- `collect.py` - Data collection script (daily updates and backfill)
+- `dashboard.py` - Generates multi-timeframe HTML dashboard from stored data
 - `fetch_data.py` - Legacy raw data fetcher (console output only)
+- `solar.db` - SQLite database (generated, in .gitignore)
 
 ## Tariff Details
 - Import tariff: Economy 7 (2-register, day/night rates) - `E-2R-VAR-22-11-01-J`
@@ -64,7 +67,11 @@ ECONOMY7_NIGHT_END=7.5
 ```
 
 ## Commands
+- Collect latest day: `uv run collect.py`
+- Backfill history: `uv run collect.py --backfill`
+- Collect specific date: `uv run collect.py --date 2026-03-01`
 - Generate dashboard: `uv run dashboard.py`
-- Raw data fetch: `uv run fetch_data.py`
+- Daily workflow: `uv run collect.py && uv run dashboard.py`
+- Run tests: `uv run pytest test_solar.py -v`
 - Add dependency: `uv add <package>`
 - Sync venv: `uv sync`
